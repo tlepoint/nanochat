@@ -58,6 +58,16 @@ def get_base_dir():
     os.makedirs(nanochat_dir, exist_ok=True)
     return nanochat_dir
 
+def get_datasets_dir():
+    # co-locate nanochat intermediates with other cached data in ~/.cache (by default)
+    if os.environ.get("NANOCHAT_DATASETS_DIR"):
+        datasets_dir = os.environ.get("NANOCHAT_DATASETS_DIR")
+    else:
+        home_dir = os.path.expanduser("~")
+        datasets_dir = os.path.join(home_dir, ".cache", "nanochat", "datasets")
+    os.makedirs(datasets_dir, exist_ok=True)
+    return datasets_dir
+
 def download_file_with_lock(url, filename):
     """
     Downloads a file from a URL to a local path in the base directory.

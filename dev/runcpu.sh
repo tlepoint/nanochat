@@ -13,6 +13,8 @@ export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
 mkdir -p $NANOCHAT_BASE_DIR
+export NANOCHAT_DATASETS_DIR="$HOME/.cache/nanochat/datasets"
+mkdir -p $NANOCHAT_DATASETS_DIR
 command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 [ -d ".venv" ] || uv venv
 uv sync --extra cpu
@@ -24,11 +26,11 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
 uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
 EVAL_BUNDLE_URL=https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip
-if [ ! -d "$NANOCHAT_BASE_DIR/eval_bundle" ]; then
+if [ ! -d "$NANOCHAT_DATASETS_DIR/eval_bundle" ]; then
     curl -L -o eval_bundle.zip $EVAL_BUNDLE_URL
     unzip -q eval_bundle.zip
     rm eval_bundle.zip
-    mv eval_bundle $NANOCHAT_BASE_DIR
+    mv eval_bundle $NANOCHAT_DATASETS_DIR
 fi
 
 # wipe the report

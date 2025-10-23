@@ -35,7 +35,7 @@ import copy
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from nanochat.common import get_base_dir
+from nanochat.common import get_base_dir, get_datasets_dir
 
 api_key = open("openroutertoken.txt").read().strip()
 
@@ -346,7 +346,7 @@ def generate_conversation(idx: int):
 num_conversations = 1000
 num_workers = 4
 
-output_file = os.path.join(get_base_dir(), "identity_conversations.jsonl")
+output_file = os.path.join(get_datasets_dir(), "identity_conversations.jsonl")
 # Wipe the file clean first to reset it
 if os.path.exists(output_file):
     os.remove(output_file)
