@@ -18,7 +18,7 @@ import torch
 from contextlib import nullcontext
 from nanochat.common import compute_init, compute_cleanup, get_datasets_dir, print0, DummyWandb, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint
+from nanochat.checkpoint_manager import find_last_step, load_checkpoint, save_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.checkpoint_manager import load_model
 import torch.distributed as dist
@@ -47,6 +47,8 @@ weight_decay = 0.0
 eval_every = 150 # -1 = disable
 eval_tokens = 20*524288
 total_batch_size = 524288
+checkpoint_every = eval_every
+resume_training = True # whether to resume from latest checkpoint
 dry_run = 0 # dry_run=1 is for experiments: we will log to wandb but we won't write checkpoints or report
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -92,8 +94,43 @@ for opt in optimizers:
         group["lr"] = group["lr"] * init_lr_frac
         group["initial_lr"] = group["lr"] # save the initial learning so we can decay easily later
 
-# Midtraining data mixture and DataLoader
+# -----------------------------------------------------------------------------
+# Check for resumption
 base_dir = get_base_dir()
+output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
+checkpoint_dir = os.path.join(base_dir, "mid_checkpoints", output_dirname)
+start_step = 0
+
+if resume_training and os.path.exists(checkpoint_dir):
+    last_step = None
+    try:
+        last_step = find_last_step(checkpoint_dir)
+        print0(f"Found existing checkpoint at step {last_step}, resuming training")
+    except:
+        print0(f"Failed to find last step in checkpoint directory: {checkpoint_dir}")
+
+    if last_step is not None:
+        # Check if training is already complete
+        start_step = last_step + 1
+        if start_step >= num_iterations:
+            print0("Training is already complete, exiting")
+            wandb_run.finish()
+            compute_cleanup()
+            exit(0)
+
+        # Load model, optimizer states, and metadata
+        model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, last_step, device, load_optimizer=True)
+        model.load_state_dict(model_data, strict=True)
+
+        if optimizer_data is not None:
+            for opt, opt_state in zip(optimizers, optimizer_data):
+                opt.load_state_dict(opt_state)
+        
+        print0(f"Loaded checkpoint at step {last_step}")
+else:
+    print0(f"Resumption disabled or checkpoint directory does not exist: {checkpoint_dir}. Starting training from scratch.")
+
+# Midtraining data mixture and DataLoader
 datasets_dir = get_datasets_dir()
 identity_conversations_filepath = os.path.join(datasets_dir, "identity_conversations.jsonl")
 train_dataset = TaskMixture([
@@ -171,6 +208,12 @@ def get_muon_momentum(it):
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
 
+# Skip ahead in data loader
+if start_step > 0:
+    print0(f"Skipping ahead in data loader to step {start_step}")
+    for _ in range(start_step * grad_accum_steps):
+        next(train_loader)
+
 # -----------------------------------------------------------------------------
 # Training loop
 x, y = next(train_loader) # prefetch the very first batch of data
@@ -178,7 +221,7 @@ min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
-step = 0
+step = start_step
 while True:
     flops_so_far = num_flops_per_token * total_batch_size * step
 
@@ -207,9 +250,7 @@ while True:
         model.train()
 
     # save checkpoint at the end of the run (only on master process)
-    if master_process and last_step and not dry_run:
-        output_dirname = f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "mid_checkpoints", output_dirname)
+    if master_process and (last_step or (step > 0 and step % checkpoint_every == 0)) and not dry_run:
         save_checkpoint(
             checkpoint_dir,
             step,

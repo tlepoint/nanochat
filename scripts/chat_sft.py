@@ -18,7 +18,7 @@ import torch.distributed as dist
 from contextlib import nullcontext
 
 from nanochat.common import compute_init, compute_cleanup, get_base_dir, get_datasets_dir, print0, DummyWandb, autodetect_device_type
-from nanochat.checkpoint_manager import load_model
+from nanochat.checkpoint_manager import find_last_step, load_checkpoint, load_model
 from nanochat.checkpoint_manager import save_checkpoint
 from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
@@ -55,6 +55,9 @@ eval_every = 100
 eval_steps = 100
 eval_metrics_every = 200
 eval_metrics_max_problems = 1024
+# Resumption
+checkpoint_every = eval_every
+resume_training = True # whether to resume from latest checkpoint
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -77,6 +80,58 @@ model, tokenizer, meta = load_model(source, device, phase="train", model_tag=mod
 orig_model = model # original, uncompiled model
 # model = torch.compile(model, dynamic=True) # doesn't work super well because of variable lengths of inputs
 engine = Engine(model, tokenizer) # will be used for inline model evaluation only
+
+# -----------------------------------------------------------------------------
+# Initialize the Optimizer
+
+optimizers = model.setup_optimizers(
+    unembedding_lr=unembedding_lr,
+    embedding_lr=embedding_lr,
+    matrix_lr=matrix_lr,
+    weight_decay=weight_decay,
+)
+# Set the initial learning rate as a fraction of the base learning rate
+for opt in optimizers:
+    for group in opt.param_groups:
+        group["lr"] = group["lr"] * init_lr_frac
+        group["initial_lr"] = group["lr"] # save the initial learning so we can decay easily later
+
+# -----------------------------------------------------------------------------
+# Check for resumption
+base_dir = get_base_dir()
+depth = model.config.n_layer
+output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
+checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+start_step = 0
+
+if resume_training and os.path.exists(checkpoint_dir):
+    last_step = None
+    try:
+        last_step = find_last_step(checkpoint_dir)
+        print0(f"Found existing checkpoint at step {last_step}, resuming training")
+    except:
+        print0(f"Failed to find last step in checkpoint directory: {checkpoint_dir}")
+
+    if last_step is not None:
+        # Check if training is already complete
+        start_step = last_step + 1
+        if start_step >= num_iterations:
+            print0("Training is already complete, exiting")
+            wandb_run.finish()
+            compute_cleanup()
+            exit(0)
+
+        # Load model, optimizer states, and metadata
+        model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, last_step, device, load_optimizer=True)
+        model.load_state_dict(model_data, strict=True)
+
+        if optimizer_data is not None:
+            for opt, opt_state in zip(optimizers, optimizer_data):
+                opt.load_state_dict(opt_state)
+
+        print0(f"Loaded checkpoint at step {last_step}")
+else:
+    print0(f"Resumption disabled or checkpoint directory does not exist: {checkpoint_dir}. Starting training from scratch.")
 
 # -----------------------------------------------------------------------------
 # Task data mixture we'll train on
@@ -143,21 +198,6 @@ train_loader = sft_data_generator(train_ds, batch_size=device_batch_size)
 build_val_loader = lambda: sft_data_generator(val_ds, batch_size=device_batch_size)
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer
-
-optimizers = model.setup_optimizers(
-    unembedding_lr=unembedding_lr,
-    embedding_lr=embedding_lr,
-    matrix_lr=matrix_lr,
-    weight_decay=weight_decay,
-)
-# Set the initial learning rate as a fraction of the base learning rate
-for opt in optimizers:
-    for group in opt.param_groups:
-        group["lr"] = group["lr"] * init_lr_frac
-        group["initial_lr"] = group["lr"] # save the initial learning so we can decay easily later
-
-# -----------------------------------------------------------------------------
 # Training loop
 
 # Learning rate scheduler
@@ -166,9 +206,15 @@ def get_lr_multiplier(it):
     return lrm
 
 # Go!
-step = 0
 train_iter = iter(train_loader)
-for step in range(num_iterations):
+
+# Skip ahead in data loader
+if start_step > 0:
+    print0(f"Skipping ahead in data loader to step {start_step}")
+    for _ in range(start_step * grad_accum_steps):
+        next(train_iter)
+
+for step in range(start_step, num_iterations):
     last_step = step == num_iterations - 1
 
     # evaluate the validation loss
@@ -207,6 +253,23 @@ for step in range(num_iterations):
             **metrics,
         })
         model.train()
+
+    # Save the model at the end of the run
+    if master_process and (last_step or (step > 0 and step % checkpoint_every == 0)):
+        model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            model.state_dict(),
+            [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
+            {
+                "step": step,
+                "val_loss": val_loss,
+                **metrics,
+                "model_config": model_config_kwargs,
+            }
+        )
+        print(f"✅ Saved model checkpoint to {checkpoint_dir}")
 
     if last_step:
         break
@@ -252,27 +315,6 @@ for step in range(num_iterations):
         "num_tokens": num_tokens_item,
     })
     step += 1
-
-# Save the model at the end of the run
-if master_process:
-    base_dir = get_base_dir()
-    depth = model.config.n_layer
-    model_tag = f"d{depth}" # base the model tag on the depth of the base model
-    checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", model_tag)
-    model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
-    save_checkpoint(
-        checkpoint_dir,
-        step,
-        model.state_dict(),
-        None, # note: we don't bother to save the optimizer state
-        {
-            "step": step,
-            "val_loss": val_loss,
-            **metrics,
-            "model_config": model_config_kwargs,
-        }
-    )
-    print(f"✅ Saved model checkpoint to {checkpoint_dir}")
 
 # Log to report
 from nanochat.report import get_report

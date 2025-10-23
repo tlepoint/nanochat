@@ -23,7 +23,7 @@ from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint
+from nanochat.checkpoint_manager import find_last_step, load_checkpoint, save_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
@@ -58,6 +58,9 @@ eval_tokens = 20*524288 # number of tokens to evaluate val loss on
 core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
+# Resumption
+checkpoint_every = eval_every
+resume_training = True # whether to resume from latest checkpoint
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
 # now allow CLI to override the settings via the configurator lol
@@ -151,6 +154,47 @@ build_val_loader = lambda: tokenizing_distributed_data_loader(device_batch_size,
 x, y = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
+# Check for resumption
+output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
+checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+start_step = 0
+
+if resume_training and os.path.exists(checkpoint_dir):
+    last_step = None
+    try:
+        last_step = find_last_step(checkpoint_dir)
+        print0(f"Found existing checkpoint at step {last_step}, resuming training")
+    except:
+        print0(f"Failed to find last step in checkpoint directory: {checkpoint_dir}")
+
+    if last_step is not None:
+        # Check if training is already complete
+        start_step = last_step + 1
+        if start_step >= num_iterations:
+            print0("Training is already complete, exiting")
+            wandb_run.finish()
+            compute_cleanup()
+            exit(0)
+
+        # Load model, optimizer states, and metadata
+        model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, last_step, device, load_optimizer=True)
+        model.load_state_dict(model_data, strict=True)
+
+        if optimizer_data is not None:
+            for opt, opt_state in zip(optimizers, optimizer_data):
+                opt.load_state_dict(opt_state)
+        
+        print0(f"Loaded checkpoint at step {last_step}")
+else:
+    print0(f"Resumption disabled or checkpoint directory does not exist: {checkpoint_dir}. Starting training from scratch.")
+
+# Skip ahead in data loader
+if start_step > 0:
+    print0(f"Skipping ahead in data loader to step {start_step}")
+    for _ in range(start_step * grad_accum_steps):
+        next(train_loader)
+
+# -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
 
 # Learning rate scheduler
@@ -178,7 +222,7 @@ smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 # note that we run +1 steps only so that we can eval and save at the end
-for step in range(num_iterations + 1):
+for step in range(start_step, num_iterations + 1):
     last_step = step == num_iterations
     flops_so_far = num_flops_per_token * total_batch_size * step
 
@@ -238,9 +282,7 @@ for step in range(num_iterations + 1):
         model.train()
 
     # save checkpoint at the end of the run (only on master process)
-    if master_process and last_step:
-        output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+    if master_process and (last_step or (step > 0 and step % checkpoint_every == 0)):
         save_checkpoint(
             checkpoint_dir,
             step,
