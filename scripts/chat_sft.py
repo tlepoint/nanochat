@@ -235,6 +235,12 @@ for step in range(num_iterations):
         opt.step()
     model.zero_grad(set_to_none=True)
 
+    # Force MPS cache cleanup to prevent memory leak
+    if device_type == "mps":
+        torch.mps.empty_cache()
+    elif device_type == "cuda":
+        torch.cuda.empty_cache()
+
     # logging
     train_loss_item = train_loss.item()
     num_tokens_item = num_tokens.item()
