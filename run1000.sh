@@ -6,37 +6,33 @@
 
 # all the setup stuff
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-mkdir -p $NANOCHAT_BASE_DIR
-export NANOCHAT_DATASETS_DIR="$HOME/.cache/nanochat/datasets"
-mkdir -p $NANOCHAT_DATASETS_DIR
-command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-[ -d ".venv" ] || uv venv
-uv sync --extra gpu
-source .venv/bin/activate
-if [ -z "$WANDB_RUN" ]; then
-    WANDB_RUN=dummy
-fi
+
+REPO_ROOT="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+source "$REPO_ROOT/dev/setup.sh"
+source "$REPO_ROOT/dev/tokenizer.sh"
+
+bootstrap_nanochat gpu
 python -m nanochat.report reset
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
-EVAL_BUNDLE_URL=https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip
-if [ ! -d "$NANOCHAT_DATASETS_DIR/eval_bundle" ]; then
-    curl -L -o eval_bundle.zip $EVAL_BUNDLE_URL
-    unzip -q eval_bundle.zip
-    rm eval_bundle.zip
-    mv eval_bundle $NANOCHAT_DATASETS_DIR
+ensure_eval_bundle
+if [ ! -f "$NANOCHAT_DATASETS_DIR/identity_conversations.jsonl" ]; then
+    log_step "Downloading identity conversations dataset."
+    curl -sSL -o $NANOCHAT_DATASETS_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+else
+    setup_success "Identity conversations dataset already present."
 fi
-curl -L -o $NANOCHAT_DATASETS_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # train tokenizer on ~4B characters and kick off download of the rest for pretraining
-python -m nanochat.dataset -n 16
+ensure_dataset_shards 16
 # start downloading the rest of the shards for a total of 800 (see below why 800)
-python -m nanochat.dataset -n 800 &
+prefetch_dataset_shards 800 DATASET_DOWNLOAD_PID || DATASET_DOWNLOAD_PID=""
 # todo: download the rest of it
-python -m scripts.tok_train --max_chars=4000000000
-python -m scripts.tok_eval
+# train/evaluate tokenizer with caching to avoid redundant work
+ensure_tokenizer 4000000000 || exit 1
+
+if [ -n "${DATASET_DOWNLOAD_PID:-}" ]; then
+    log_step "Waiting for dataset download to complete..."
+    wait "$DATASET_DOWNLOAD_PID"
+fi
 
 # Documenting my process for determining the hyperparameters for this run1000.sh script:
 # We want a budget of approx. $1000 ~= 41.6 hours of 8XH100 compute

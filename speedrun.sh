@@ -12,34 +12,12 @@
 
 # Default intermediate artifacts directory is in ~/.cache/nanochat
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
-mkdir -p $NANOCHAT_BASE_DIR
-export NANOCHAT_DATASETS_DIR="$HOME/.cache/nanochat/datasets"
-mkdir -p $NANOCHAT_DATASETS_DIR
 
-# -----------------------------------------------------------------------------
-# Python venv setup with uv
+REPO_ROOT="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+source "$REPO_ROOT/dev/setup.sh"
+source "$REPO_ROOT/dev/tokenizer.sh"
 
-# install uv (if not already installed)
-command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-# create a .venv local virtual environment (if it doesn't exist)
-[ -d ".venv" ] || uv venv
-# install the repo dependencies
-uv sync --extra gpu
-# activate venv so that `python` uses the project's venv instead of system python
-source .venv/bin/activate
-
-# -----------------------------------------------------------------------------
-# wandb setup
-# If you wish to use wandb for logging (it's nice!, recommended).
-# 1) Make sure to first log in to wandb, e.g. run:
-#    `wandb login`
-# 2) Set the WANDB_RUN environment variable when running this script, e.g.:
-#    `WANDB_RUN=d26 bash speedrun.sh`
-if [ -z "$WANDB_RUN" ]; then
-    # by default use "dummy" : it's handled as a special case, skips logging to wandb
-    WANDB_RUN=dummy
-fi
+bootstrap_nanochat gpu
 
 # -----------------------------------------------------------------------------
 # During the course of the run, we will be writing markdown reports to the report/
@@ -50,39 +28,23 @@ python -m nanochat.report reset
 # -----------------------------------------------------------------------------
 # Tokenizer
 
-# Install Rust / Cargo
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-
-# Build the rustbpe Tokenizer
-uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
-
 # Download the first ~2B characters of pretraining dataset
 # look at dev/repackage_data_reference.py for details on how this data was prepared
 # each data shard is ~250M chars
 # so we download 2e9 / 250e6 = 8 data shards at this point
 # each shard is ~100MB of text (compressed), so this is about ~800MB of data on disk
-python -m nanochat.dataset -n 8
+ensure_dataset_shards 8
 # Immediately also kick off downloading more shards in the background while tokenizer trains
 # See comment below for why 240 is the right number here
-python -m nanochat.dataset -n 240 &
-DATASET_DOWNLOAD_PID=$!
+prefetch_dataset_shards 240 DATASET_DOWNLOAD_PID || DATASET_DOWNLOAD_PID=""
 # train the tokenizer with vocab size 2**16 = 65536 on ~2B characters of data
-python -m scripts.tok_train --max_chars=2000000000
-# evaluate the tokenizer (report compression ratio etc.)
-python -m scripts.tok_eval
+# train/evaluate tokenizer with caching to avoid redundant work
+ensure_tokenizer 2000000000 || exit 1
 
 # -----------------------------------------------------------------------------
 # Base model (pretraining)
 
-# Download the eval_bundle from s3 to evaluate CORE metric during training (~162MB)
-EVAL_BUNDLE_URL=https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip
-if [ ! -d "$NANOCHAT_DATASETS_DIR/eval_bundle" ]; then
-    curl -L -o eval_bundle.zip $EVAL_BUNDLE_URL
-    unzip -q eval_bundle.zip
-    rm eval_bundle.zip
-    mv eval_bundle $NANOCHAT_DATASETS_DIR
-fi
+ensure_eval_bundle
 
 # The d20 model is 561M parameters.
 # Chinchilla says #tokens = 20X #params, so we need 561e6 * 20 = 11.2B tokens.
@@ -90,8 +52,10 @@ fi
 # At 250M chars/shard, this is 54B / 250M ~= 216 shards needed for pretraining.
 # Round up to 240 for safety. At ~100MB/shard, this downloads ~24GB of data to disk.
 # (The total number of shards available in the entire dataset is 1822.)
-echo "Waiting for dataset download to complete..."
-wait $DATASET_DOWNLOAD_PID
+if [ -n "${DATASET_DOWNLOAD_PID:-}" ]; then
+    log_step "Waiting for dataset download to complete..."
+    wait "$DATASET_DOWNLOAD_PID"
+fi
 
 # pretrain the d20 model
 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
@@ -105,7 +69,12 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_eval
 
 # download 2.3MB of synthetic identity conversations to impart a personality to nanochat
 # see dev/gen_sft_data.py for details on how this data was prepared and to get a sense of how you can easily tune it
-curl -L -o $NANOCHAT_DATASETS_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+if [ ! -f "$NANOCHAT_DATASETS_DIR/identity_conversations.jsonl" ]; then
+    log_step "Downloading identity conversations dataset."
+    curl -sSL -o $NANOCHAT_DATASETS_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+else
+    setup_success "Identity conversations dataset already present."
+fi
 
 # run midtraining and eval the model
 torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --run=$WANDB_RUN

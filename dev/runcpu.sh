@@ -10,51 +10,37 @@
 
 # all the setup stuff
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
-mkdir -p $NANOCHAT_BASE_DIR
-export NANOCHAT_DATASETS_DIR="$HOME/.cache/nanochat/datasets"
-mkdir -p $NANOCHAT_DATASETS_DIR
-command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-[ -d ".venv" ] || uv venv
-uv sync --extra cpu
-source .venv/bin/activate
-if [ -z "$WANDB_RUN" ]; then
-    WANDB_RUN=dummy
-fi
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
-EVAL_BUNDLE_URL=https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip
-if [ ! -d "$NANOCHAT_DATASETS_DIR/eval_bundle" ]; then
-    curl -L -o eval_bundle.zip $EVAL_BUNDLE_URL
-    unzip -q eval_bundle.zip
-    rm eval_bundle.zip
-    mv eval_bundle $NANOCHAT_DATASETS_DIR
-fi
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+source "$SCRIPT_DIR/setup.sh"
+source "$SCRIPT_DIR/tokenizer.sh"
+
+bootstrap_nanochat cpu
+ensure_eval_bundle
 
 # wipe the report
 python -m nanochat.report reset
 
 # train tokenizer on ~1B characters
-python -m nanochat.dataset -n 4
-python -m scripts.tok_train --max_chars=1000000000
-python -m scripts.tok_eval
+ensure_dataset_shards 4
+# train/evaluate tokenizer with caching to avoid redundant work
+ensure_tokenizer 1000000000 || exit 1
 
-# train a very small 4 layer model on the CPU
+# train a very small 8 layer model on the CPU
 # each optimization step processes a single sequence of 1024 tokens
-# we only run 50 steps of optimization (bump this to get better results)
+# we only run 400 steps of optimization (bump this to get better results)
 python -m scripts.base_train \
-    --depth=4 \
+    --depth=8 \
     --max_seq_len=1024 \
     --device_batch_size=1 \
     --total_batch_size=1024 \
     --eval_every=50 \
+    --checkpoint_every=50 \
     --eval_tokens=4096 \
     --core_metric_every=50 \
     --core_metric_max_per_task=12 \
     --sample_every=50 \
-    --num_iterations=50
+    --num_iterations=400
 python -m scripts.base_loss --device_batch_size=1 --split_tokens=4096
 python -m scripts.base_eval --max-per-task=16
 

@@ -14,6 +14,7 @@ import requests
 import pyarrow.parquet as pq
 from multiprocessing import Pool
 
+from nanochat import logging as nlog
 from nanochat.common import get_datasets_dir
 
 # -----------------------------------------------------------------------------
@@ -26,6 +27,25 @@ index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the f
 base_dir = get_datasets_dir()
 DATA_DIR = os.path.join(base_dir, "base_data")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+QUIET = os.environ.get("NANOCHAT_DATASET_QUIET") == "1"
+
+
+def _info(message: str, *, force: bool = False) -> None:
+    nlog.info("dataset", message, quiet=(QUIET and not force))
+
+
+def _success(message: str, *, force: bool = False) -> None:
+    nlog.success("dataset", message, quiet=(QUIET and not force))
+
+
+def _warn(message: str) -> None:
+    nlog.warn("dataset", message)
+
+
+def _error(message: str) -> None:
+    nlog.error("dataset", message)
+
 
 # -----------------------------------------------------------------------------
 # These functions are useful utilities to other modules, can/should be imported
@@ -64,12 +84,12 @@ def download_single_file(index):
     filename = index_to_filename(index)
     filepath = os.path.join(DATA_DIR, filename)
     if os.path.exists(filepath):
-        print(f"Skipping {filepath} (already exists)")
+        _info(f"Skipping {filepath} (already exists)")
         return True
 
     # Construct the remote URL for this file
     url = f"{BASE_URL}/{filename}"
-    print(f"Downloading {filename}...")
+    _info(f"Downloading {filename}...")
 
     # Download with retries
     max_attempts = 5
@@ -85,11 +105,11 @@ def download_single_file(index):
                         f.write(chunk)
             # Move temp file to final location
             os.rename(temp_path, filepath)
-            print(f"Successfully downloaded {filename}")
+            _success(f"Successfully downloaded {filename}")
             return True
 
         except (requests.RequestException, IOError) as e:
-            print(f"Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
+            _warn(f"Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
             # Clean up any partial files
             for path in [filepath + f".tmp", filepath]:
                 if os.path.exists(path):
@@ -100,10 +120,10 @@ def download_single_file(index):
             # Try a few times with exponential backoff: 2^attempt seconds
             if attempt < max_attempts:
                 wait_time = 2 ** attempt
-                print(f"Waiting {wait_time} seconds before retry...")
+                _warn(f"Waiting {wait_time} seconds before retry...")
                 time.sleep(wait_time)
             else:
-                print(f"Failed to download {filename} after {max_attempts} attempts")
+                _error(f"Failed to download {filename} after {max_attempts} attempts")
                 return False
 
     return False
@@ -113,16 +133,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download FineWeb-Edu 100BT dataset shards")
     parser.add_argument("-n", "--num-files", type=int, default=-1, help="Number of shards to download (default: -1), -1 = disable")
     parser.add_argument("-w", "--num-workers", type=int, default=4, help="Number of parallel download workers (default: 4)")
+    parser.add_argument("--quiet", action="store_true", help="Suppress progress logs; only report summary and errors")
     args = parser.parse_args()
+
+    QUIET = args.quiet
+    if QUIET:
+        os.environ["NANOCHAT_DATASET_QUIET"] = "1"
+    else:
+        os.environ.pop("NANOCHAT_DATASET_QUIET", None)
 
     num = MAX_SHARD + 1 if args.num_files == -1 else min(args.num_files, MAX_SHARD + 1)
     ids_to_download = list(range(num))
-    print(f"Downloading {len(ids_to_download)} shards using {args.num_workers} workers...")
-    print(f"Target directory: {DATA_DIR}")
-    print()
+    _info(f"Downloading {len(ids_to_download)} shards using {args.num_workers} workers...")
+    _info(f"Target directory: {DATA_DIR}")
+    if not QUIET:
+        print()
     with Pool(processes=args.num_workers) as pool:
         results = pool.map(download_single_file, ids_to_download)
 
     # Report results
     successful = sum(1 for success in results if success)
-    print(f"Done! Downloaded: {successful}/{len(ids_to_download)} shards to {DATA_DIR}")
+    _success(f"Done! Downloaded: {successful}/{len(ids_to_download)} shards to {DATA_DIR}", force=True)
